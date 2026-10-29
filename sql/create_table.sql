@@ -1,0 +1,7 @@
+CREATE SCHEMA IF NOT EXISTS cicd_demo;
+
+CREATE TABLE IF NOT EXISTS cicd_demo.employee (
+    employee_id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    employee_name VARCHAR(100) NOT NULL,
+    department VARCHAR(100)
+);
