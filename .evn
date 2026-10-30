@@ -1,5 +1,0 @@
-PGHOST=localhost
-PGPORT=5433
-PGDATABASE=cicd
-PGUSER=postgres
-PGPASSWORD=Shivay@18
