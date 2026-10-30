@@ -100,3 +100,6 @@ ON hr.employees(first_name, last_name);
 
 CREATE INDEX IF NOT EXISTS idx_attendance_date
 ON hr.attendance(attendance_date);
+
+CREATE INDEX IF NOT EXISTS idx_employee_projects_project
+ON hr.employee_projects(project_id);
