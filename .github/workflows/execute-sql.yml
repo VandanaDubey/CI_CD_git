@@ -85,6 +85,7 @@ jobs:
 
             $env:PGCONNECT_TIMEOUT = '10'
             $env:PGAPPNAME = 'GitHubActions-SQL-Deployment'
+            $env:PGSSLMODE = 'disable'
 
             $psql = Get-Command psql -ErrorAction SilentlyContinue
             if (-not $psql) {
