@@ -178,3 +178,13 @@ SELECT
     project_status
 FROM hr.projects
 WHERE project_status = 'ACTIVE';
+
+
+
+CREATE OR REPLACE VIEW hr.vw_active_projects11 AS
+SELECT
+    project_id,
+    project_code,
+    project_name
+FROM hr.projects
+WHERE project_status = 'ACTIVE';
