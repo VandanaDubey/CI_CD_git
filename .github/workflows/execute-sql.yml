@@ -6,11 +6,16 @@ on:
     branches:
       - main
     paths:
-      - 'sql/**'
+      - 'sql/migrations/**'
   workflow_dispatch:
 
 permissions:
   contents: read
+
+# Prevent overlapping deployment workflows in this repository.
+concurrency:
+  group: shared-postgresql-database-migrations
+  cancel-in-progress: false
 
 jobs:
   execute-sql:
@@ -22,12 +27,8 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Execute changed SQL files
+      - name: Execute pending PostgreSQL migrations
         shell: powershell
-        env:
-          BEFORE_SHA: ${{ github.event.before }}
-          EVENT_NAME: ${{ github.event_name }}
-          COMMIT_SHA: ${{ github.sha }}
         run: |
           $ErrorActionPreference = 'Stop'
 
@@ -42,13 +43,15 @@ jobs:
           }
 
           $exitCode = 0
+          $wrapperPath = Join-Path $env:RUNNER_TEMP 'migration-wrapper.sql'
 
           try {
-            Write-Log "START: PostgreSQL SQL deployment"
-            Write-Log "Commit: $env:COMMIT_SHA"
+            Write-Log "START: PostgreSQL migration deployment"
+            Write-Log "Commit: $env:GITHUB_SHA"
 
-            # Read credentials from the original local .env file.
+            # Load database settings from the runner's local .env file.
             $envFile = 'D:\CI_CD_learning\CI_CD_git\.env'
+
             if (-not (Test-Path -LiteralPath $envFile)) {
               throw "Local environment file not found: $envFile"
             }
@@ -84,50 +87,94 @@ jobs:
             }
 
             $env:PGCONNECT_TIMEOUT = '10'
-            $env:PGAPPNAME = 'GitHubActions-SQL-Deployment'
+            $env:PGAPPNAME = 'GitHubActions-SQL-Migrations'
             $env:PGSSLMODE = 'disable'
 
             $psql = Get-Command psql -ErrorAction SilentlyContinue
             if (-not $psql) {
-              throw 'psql was not found in PATH. Add the PostgreSQL bin directory to PATH.'
+              throw 'psql was not found in PATH.'
             }
 
-            Write-Log "Database client: $(& psql --version)"
+            Write-Log "Client: $(& psql --version)"
             Write-Log "Database: $env:PGDATABASE"
             Write-Log "Host: $env:PGHOST; Port: $env:PGPORT"
 
-            if ($env:EVENT_NAME -eq 'workflow_dispatch') {
-              $files = @(git ls-files -- 'sql/*.sql')
+            # Confirm that the shared migration history table exists.
+            $tableCheck = & psql -X -A -t -c "SELECT to_regclass('public.schema_migrations') IS NOT NULL;"
+            if ($LASTEXITCODE -ne 0 -or "$tableCheck".Trim() -ne 't') {
+              throw 'public.schema_migrations does not exist or cannot be checked.'
             }
-            elseif ($env:BEFORE_SHA -match '^0+$') {
-              $files = @(git ls-files -- 'sql/*.sql')
-            }
-            else {
-              $files = @(git diff --diff-filter=ACMR --name-only `
-                $env:BEFORE_SHA $env:COMMIT_SHA -- 'sql/*.sql')
-            }
+
+            # Read all tracked migration files, not the older sql/*.sql files.
+            $files = @(git ls-files -- 'sql/migrations/' |
+              Where-Object { $_ -match '^sql/migrations/[A-Za-z0-9_.-]+\.sql$' } |
+              Sort-Object)
 
             if ($LASTEXITCODE -ne 0) {
-              throw 'Could not identify changed SQL files.'
+              throw 'Could not list migration files.'
             }
 
-            $files = @($files | Where-Object { $_ -match '^sql/.+\.sql$' } | Sort-Object)
-
             if ($files.Count -eq 0) {
-              Write-Log 'No added or modified SQL files to execute.'
+              Write-Log 'No migration files found.'
             }
 
             foreach ($file in $files) {
+              $version = [System.IO.Path]::GetFileNameWithoutExtension($file)
+
+              # Validate version and script name before passing them to psql.
+              if ($version -notmatch '^[A-Za-z0-9_.-]+$') {
+                throw "Invalid migration filename: $file"
+              }
+
               $fullPath = Join-Path $env:GITHUB_WORKSPACE ($file -replace '/', '\')
 
               if (-not (Test-Path -LiteralPath $fullPath)) {
-                Write-Log "SKIPPED: $file is not present in this commit."
-                continue
+                throw "Migration file not found: $file"
               }
 
-              Write-Log "EXECUTING: $file"
+              # psql's \i command uses forward slashes on Windows.
+              $sqlPath = $fullPath -replace '\\', '/'
 
-              & psql -X --set ON_ERROR_STOP=1 --single-transaction --file="$fullPath" 2>&1 |
+              Write-Log "CHECKING: $file"
+
+              # One transaction per migration.
+              # The advisory lock serializes deployments using this lock key.
+              $wrapper = @"
+          BEGIN;
+
+          SELECT pg_advisory_xact_lock(741852963);
+
+          SELECT EXISTS (
+              SELECT 1
+              FROM public.schema_migrations
+              WHERE version = :'version'
+                AND execution_status = 'SUCCESS'
+          ) AS already_applied \gset
+
+          \if :already_applied
+          \echo SKIPPED: migration already recorded
+          \else
+          \echo EXECUTING: migration
+          \i '$sqlPath'
+
+          INSERT INTO public.schema_migrations
+              (version, script_name, execution_status)
+          VALUES
+              (:'version', :'script_name', 'SUCCESS');
+
+          \echo MIGRATION_RECORDED: success
+          \endif
+
+          COMMIT;
+          "@
+
+              [System.IO.File]::WriteAllText(
+                $wrapperPath,
+                $wrapper,
+                [System.Text.UTF8Encoding]::new($false)
+              )
+
+              & psql -X --set=ON_ERROR_STOP=1 --set="version=$version" --set="script_name=$file" --file="$wrapperPath" 2>&1 |
                 ForEach-Object {
                   $message = "$_"
                   Add-Content -LiteralPath $logFile -Value $message
@@ -136,10 +183,10 @@ jobs:
 
               if ($LASTEXITCODE -ne 0) {
                 Write-Log "FAILED: $file"
-                throw "SQL execution failed for $file"
+                throw "Migration failed: $file"
               }
 
-              Write-Log "SUCCESS: $file"
+              Write-Log "COMPLETED: $file"
             }
 
             Write-Log 'FINAL STATUS: SUCCESS'
@@ -151,6 +198,7 @@ jobs:
           }
           finally {
             Remove-Item Env:PGPASSWORD -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $wrapperPath -ErrorAction SilentlyContinue
             Write-Log 'Deployment finished.'
           }
 
@@ -162,7 +210,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: postgres-log-${{ github.run_id }}
+          name: postgres-migration-log-${{ github.run_id }}
           path: logs/
           if-no-files-found: warn
           retention-days: 30
